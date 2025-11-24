@@ -1,0 +1,272 @@
+!pip install google-adk
+!gcloud services enable aiplatform.googleapis.com --project=capstone-project-55
+
+import logging
+import sys
+import datetime
+from google import genai
+from google.genai import types
+
+# --- 1. OBSERVABILITY & TRACING (THE "GLASS BOX") ---
+# WHY: In healthcare, we cannot have a "Black Box" AI. We need to know exactly 
+# what the model thought and why it made a decision.
+# HOW: We use OpenTelemetry to create "Traces" that record the input, 
+# the model's reasoning process, and the tool outputs for auditing/compliance.
+from opentelemetry import trace
+from opentelemetry.sdk.trace import TracerProvider
+from opentelemetry.sdk.trace.export import ConsoleSpanExporter, SimpleSpanProcessor
+
+# Set up tracing to monitor the AI's decision process
+trace.set_tracer_provider(TracerProvider())
+tracer = trace.get_tracer("healthcare_agent")
+# We export traces to the Console so judges/developers can see the "thought process" immediately.
+span_processor = SimpleSpanProcessor(ConsoleSpanExporter())
+trace.get_tracer_provider().add_span_processor(span_processor)
+
+# Configure logging to output to standard out so it's visible in Notebooks
+logging.basicConfig(level=logging.INFO, format='[%(levelname)s] %(message)s', stream=sys.stdout)
+
+# --- CONFIGURATION ---
+# 🚨 IMPORTANT: Replace 'capstoneproject1' with your actual Google Cloud Project ID.
+PROJECT_ID = "capstoneproject1" 
+LOCATION = "us-central1"
+
+# --- 2. CONTEXT ENGINEERING (STATE MANAGEMENT) ---
+class PatientMemoryBank:
+    """
+    WHY: LLMs are 'stateless' (they forget everything after each turn).
+    In healthcare, forgetting a patient has diabetes is dangerous.
+    HOW: This class acts as a persistent state layer. It injects the 'Medical History'
+    into the prompt context before the model ever sees the user's question.
+    """
+    def __init__(self, patient_id: str):
+        self.patient_id = patient_id
+        # Simulating data fetched from a secure electronic health record (EHR)
+        self.medical_history = [
+            "Patient diagnosed with Type 2 Diabetes in 2022.",
+            "Patient has a known allergy to Penicillin."
+        ]
+        self.current_session_notes = []  # Tracks what happens during this conversation
+
+    def get_context_summary(self) -> str:
+        """
+        Creates a 'System Instruction' string that forces the model to 
+        acknowledge the patient's specific constraints.
+        Think of this as giving the AI a patient chart before it talks to them.
+        """
+        return f"""
+        PATIENT CONTEXT:
+        - ID: {self.patient_id}
+        - KNOWN CONDITIONS: {"; ".join(self.medical_history)}
+        - CURRENT SESSION NOTES: {"; ".join(self.current_session_notes)}
+        """
+
+    def add_observation(self, note: str):
+        """Adds new information to the session memory"""
+        self.current_session_notes.append(note)
+
+# --- 3. TOOL DEFINITIONS (FUNCTION CALLING) ---
+# WHY: Models are good at language, but bad at "doing" things. 
+# HOW: We define "Tools" (Python functions) and describe them in a schema 
+# that the Gemini model understands. This allows the AI to "book appointments"
+# rather than just hallucinating that it did.
+
+def check_availability(department: str) -> str:
+    """Mock API: Checks doctor availability for a specific department."""
+    # In real system, this would call your hospital's scheduling API
+    return f"Dr. Smith ({department}) has openings tomorrow at 10:00 AM and 2:00 PM."
+
+def book_appointment(time_slot: str, reason: str) -> str:
+    """Mock API: Books an appointment slot with reason."""
+    # In real system, this would create an actual appointment in your database
+    return f"CONFIRMED: Appointment booked for {time_slot}. Reason: {reason}"
+
+# Define the Tool Schema for Gemini - this tells the AI what functions it can call
+scheduling_tools = [
+    types.Tool(function_declarations=[
+        types.FunctionDeclaration(
+            name="check_availability",
+            description="Checks availability for a medical department.",
+            parameters=types.Schema(
+                type=types.Type.OBJECT,
+                properties={
+                    "department": types.Schema(type=types.Type.STRING),
+                },
+                required=["department"]  # These parameters are mandatory
+            )
+        ),
+        types.FunctionDeclaration(
+            name="book_appointment",
+            description="Books a medical appointment.",
+            parameters=types.Schema(
+                type=types.Type.OBJECT,
+                properties={
+                    "time_slot": types.Schema(type=types.Type.STRING),
+                    "reason": types.Schema(type=types.Type.STRING),
+                },
+                required=["time_slot", "reason"]  # Both are required
+            )
+        )
+    ])
+]
+
+# Map string names to actual Python functions for execution
+# When AI says "call check_availability", this dictionary tells us which function to run
+tool_map = {
+    "check_availability": check_availability,
+    "book_appointment": book_appointment
+}
+
+# --- 4. THE AGENT CLASS (VERTEX AI WRAPPER) ---
+class HealthcareAgent:
+    """
+    Wraps the Gemini Client to handle the 'Think-Act-Observe' loop.
+    Each agent is a specialist with specific capabilities.
+    """
+    def __init__(self, name: str, model: str, role_prompt: str, tools: list = None):
+        self.name = name
+        # WHY: We use vertexai=True to leverage Google Cloud's secure infrastructure 
+        # instead of passing raw API keys in code (Security Best Practice).
+        self.client = genai.Client(vertexai=True, project=PROJECT_ID, location=LOCATION)
+        self.model = model
+        self.role_prompt = role_prompt  # Defines the agent's personality and limitations
+        self.tools = tools  # What actions this agent can perform
+
+    def think_and_act(self, input_text: str, context: str = "") -> str:
+        # Start a Trace Span to record this interaction for auditing
+        with tracer.start_as_current_span(f"Agent_{self.name}") as span:
+            span.set_attribute("input", input_text)  # Log what the user asked
+            
+            # Combine Role (Who am I?) + Context (Who is the patient?) + Input (What do they want?)
+            full_prompt = f"{self.role_prompt}\n\n{context}\n\nUSER INPUT: {input_text}"
+            
+            try:
+                # WHY: Temperature 0.0 makes the model 'deterministic'. 
+                # In healthcare, we want consistent facts, not creative poetry.
+                config = types.GenerateContentConfig(
+                    tools=self.tools,  # What tools this agent can use
+                    temperature=0.0  # Makes responses predictable and factual
+                )
+                
+                # Send the complete prompt to Gemini
+                response = self.client.models.generate_content(
+                    model=self.model,
+                    contents=full_prompt,
+                    config=config
+                )
+
+                # --- TOOL EXECUTION LOGIC ---
+                # Check if the model wants to call a function (The "Act" phase)
+                if response.candidates[0].content.parts[0].function_call:
+                    fn_call = response.candidates[0].content.parts[0].function_call
+                    fn_name = fn_call.name  # Which function to call
+                    fn_args = fn_call.args  # What arguments to pass
+                    
+                    logging.info(f"[{self.name}] 🛠️ DECISION: Calling Tool '{fn_name}'")
+                    
+                    if fn_name in tool_map:
+                        # Execute the actual Python code with the provided arguments
+                        tool_result = tool_map[fn_name](**fn_args)
+                        
+                        # Log the result into the Trace for auditing
+                        span.set_attribute("tool_output", str(tool_result))
+                        return f"[TOOL ACTION COMPLETED]: {tool_result}"
+                    else:
+                        return "Error: Unknown tool requested"
+                
+                # If no function call, just return the text response
+                return response.text
+            except Exception as e:
+                logging.error(f"Error in Agent {self.name}: {e}")
+                return "System Error: Unable to process request."
+
+# --- 5. ORCHESTRATION (THE ROUTER PATTERN) ---
+class CareCoordinator:
+    """
+    WHY: A single agent cannot do everything well.
+    HOW: We use a 'Router' pattern. This Coordinator analyzes the request 
+    and sends it to the specialist agent best suited for the job.
+    Think of this as a hospital receptionist who directs patients to the right department.
+    """
+    def __init__(self):
+        # Initialize patient memory - in real system, this would load from database
+        self.memory = PatientMemoryBank(patient_id="PT-12345")
+        
+        # Specialist 1: MEDICAL INFO AGENT
+        # Capability: Uses Google Search Grounding for accuracy.
+        self.med_info_agent = HealthcareAgent(
+            name="MedicalInfo",
+            model="gemini-2.0-flash-exp", 
+            role_prompt="You are a medical assistant. Check symptoms against known conditions using Google Search. NEVER diagnose, only provide information.",
+            tools=[types.Tool(google_search=types.GoogleSearch())]  # This agent can search the web
+        )
+
+        # Specialist 2: SCHEDULER AGENT
+        # Capability: Uses Custom Tools (Function Calling) to book slots.
+        self.scheduler_agent = HealthcareAgent(
+            name="Scheduler",
+            model="gemini-2.0-flash-exp",
+            role_prompt="You are a front-desk scheduler. Check availability and book appointments.",
+            tools=scheduling_tools  # This agent can call our scheduling functions
+        )
+
+    def handle_patient_request(self, user_input: str):
+        print(f"\n🤖 SYSTEM PROCESSING...")
+        
+        # 1. Retrieve Context from Memory Bank
+        patient_context = self.memory.get_context_summary()
+        
+        # 2. Routing Logic - determine which specialist should handle this request
+        # If the user mentions scheduling keywords, route to the Scheduler.
+        # Otherwise, assume it's a medical question.
+        if any(word in user_input.lower() for word in ["book", "schedule", "appointment", "availability"]):
+            print(">> 🔀 Routing to: SCHEDULER AGENT (Action Required)")
+            response = self.scheduler_agent.think_and_act(user_input, patient_context)
+            # Remember what action was taken for this patient
+            self.memory.add_observation(f"Action taken: {response}")
+            print(f"✅ Scheduler says: {response}")
+
+        else:
+            print(">> 🔀 Routing to: MEDICAL INFO AGENT (Knowledge Required)")
+            response = self.med_info_agent.think_and_act(user_input, patient_context)
+            # Remember what advice was given
+            self.memory.add_observation(f"Advice given: {response}")
+            print(f"✅ Medical Info says: {response}")
+
+# --- 6. MAIN INTERACTIVE LOOP ---
+if __name__ == "__main__":
+    # Initialize our healthcare system
+    system = CareCoordinator()
+    
+    print("\n" + "="*50)
+    print("🏥 CareSync: Agentic Healthcare Interface")
+    print("="*50)
+    print("System Online. Patient Context Loaded (Diabetes, Penicillin Allergy).")
+    print("Type 'exit' to stop.\n")
+
+    # Main conversation loop
+    while True:
+        try:
+            # Interactive Input - this is where the user talks to the system
+            user_input = input("👤 PATIENT (You): ")
+            
+            # Exit conditions
+            if user_input.lower() in ['exit', 'quit']:
+                print("\n👋 Session ended.")
+                break
+            
+            # Skip empty inputs
+            if not user_input.strip():
+                continue
+
+            # Process the user's request through our agent system
+            system.handle_patient_request(user_input)
+            print("-" * 50)  # Visual separator for readability
+            
+        except KeyboardInterrupt:
+            # Handle Ctrl+C gracefully
+            print("\n\nSession interrupted by user.")
+            break
+        except Exception as e:
+            # Catch any unexpected errors
+            print(f"❌ Error: {e}")
