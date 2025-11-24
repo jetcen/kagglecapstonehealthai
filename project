@@ -1,0 +1,204 @@
+!pip install google-adk
+!gcloud services enable aiplatform.googleapis.com --project=capstone-project-55
+import logging
+import sys
+from google import genai
+from google.genai import types
+
+# --- OBSERVABILITY SETUP ---
+from opentelemetry import trace
+from opentelemetry.sdk.trace import TracerProvider
+from opentelemetry.sdk.trace.export import ConsoleSpanExporter, SimpleSpanProcessor
+
+# Setup Tracing (The "Glass Box" view)
+trace.set_tracer_provider(TracerProvider())
+tracer = trace.get_tracer("healthcare_agent")
+span_processor = SimpleSpanProcessor(ConsoleSpanExporter())
+trace.get_tracer_provider().add_span_processor(span_processor)
+
+# Set logging to INFO so we see the agent's "thoughts" in the output
+logging.basicConfig(level=logging.INFO, format='[%(levelname)s] %(message)s', stream=sys.stdout)
+
+# --- 1. MEMORY & CONTEXT ENGINEERING ---
+
+class PatientMemoryBank:
+    def __init__(self, patient_id: str):
+        self.patient_id = patient_id
+        self.medical_history = [
+            "Patient diagnosed with Type 2 Diabetes in 2022.",
+            "Patient has a known allergy to Penicillin."
+        ]
+        self.current_session_notes = []
+
+    def get_context_summary(self) -> str:
+        return f"""
+        PATIENT CONTEXT:
+        - ID: {self.patient_id}
+        - KNOWN CONDITIONS: {"; ".join(self.medical_history)}
+        - CURRENT SESSION NOTES: {"; ".join(self.current_session_notes)}
+        """
+
+    def add_observation(self, note: str):
+        self.current_session_notes.append(note)
+
+# --- 2. TOOL DEFINITIONS ---
+
+def check_availability(department: str) -> str:
+    """Checks doctor availability for a specific department."""
+    return f"Dr. Smith ({department}) has openings tomorrow at 10:00 AM and 2:00 PM."
+
+def book_appointment(time_slot: str, reason: str) -> str:
+    """Books a specific time slot."""
+    return f"CONFIRMED: Appointment booked for {time_slot}. Reason: {reason}"
+
+scheduling_tools = [
+    types.Tool(function_declarations=[
+        types.FunctionDeclaration(
+            name="check_availability",
+            description="Checks availability for a medical department.",
+            parameters=types.Schema(
+                type=types.Type.OBJECT,
+                properties={
+                    "department": types.Schema(type=types.Type.STRING),
+                },
+                required=["department"]
+            )
+        ),
+        types.FunctionDeclaration(
+            name="book_appointment",
+            description="Books a medical appointment.",
+            parameters=types.Schema(
+                type=types.Type.OBJECT,
+                properties={
+                    "time_slot": types.Schema(type=types.Type.STRING),
+                    "reason": types.Schema(type=types.Type.STRING),
+                },
+                required=["time_slot", "reason"]
+            )
+        )
+    ])
+]
+
+tool_map = {
+    "check_availability": check_availability,
+    "book_appointment": book_appointment
+}
+
+# --- 3. AGENT CLASS ---
+
+class HealthcareAgent:
+    def __init__(self, name: str, model: str, role_prompt: str, tools: list = None):
+        self.name = name
+        # IMPORTANT: Ensure 'project' matches your actual Google Cloud Project ID
+        self.client = genai.Client(vertexai=True, project="capstone-project-55", location="us-central1")
+        self.model = model
+        self.role_prompt = role_prompt
+        self.tools = tools
+
+    def think_and_act(self, input_text: str, context: str = "") -> str:
+        with tracer.start_as_current_span(f"Agent_{self.name}") as span:
+            span.set_attribute("input", input_text)
+            
+            full_prompt = f"{self.role_prompt}\n\n{context}\n\nUSER INPUT: {input_text}"
+            
+            try:
+                config = types.GenerateContentConfig(
+                    tools=self.tools,
+                    temperature=0.0
+                )
+                
+                response = self.client.models.generate_content(
+                    model=self.model,
+                    contents=full_prompt,
+                    config=config
+                )
+
+                # Handle Tool Usage
+                if response.candidates[0].content.parts[0].function_call:
+                    fn_call = response.candidates[0].content.parts[0].function_call
+                    fn_name = fn_call.name
+                    fn_args = fn_call.args
+                    
+                    logging.info(f"[{self.name}] 🛠️ DECISION: Calling Tool '{fn_name}' with args {fn_args}")
+                    
+                    if fn_name in tool_map:
+                        tool_result = tool_map[fn_name](**fn_args)
+                        span.set_attribute("tool_output", str(tool_result))
+                        return f"[TOOL RESULT]: {tool_result}"
+                
+                return response.text
+            except Exception as e:
+                logging.error(f"Error in Agent {self.name}: {e}")
+                return "I'm sorry, I encountered a system error processing that request."
+
+# --- 4. ORCHESTRATION ---
+
+class CareCoordinator:
+    def __init__(self):
+        self.memory = PatientMemoryBank(patient_id="PT-12345")
+        
+        self.med_info_agent = HealthcareAgent(
+            name="MedicalInfo",
+            model="gemini-2.0-flash-exp", 
+            role_prompt="You are a medical assistant. Check symptoms against known conditions. NEVER diagnose.",
+            tools=[types.Tool(google_search=types.GoogleSearch())]
+        )
+
+        self.scheduler_agent = HealthcareAgent(
+            name="Scheduler",
+            model="gemini-2.0-flash-exp",
+            role_prompt="You are a front-desk scheduler. Check availability and book appointments.",
+            tools=scheduling_tools
+        )
+
+    def handle_patient_request(self, user_input: str):
+        print(f"\n🤖 SYSTEM PROCESSING...")
+        
+        patient_context = self.memory.get_context_summary()
+        
+        # Simple keyword routing
+        if any(word in user_input.lower() for word in ["book", "schedule", "appointment", "availability"]):
+            print(">> 🔀 Routing to: SCHEDULER AGENT")
+            response = self.scheduler_agent.think_and_act(user_input, patient_context)
+            print(f"✅ Scheduler says: {response}")
+            self.memory.add_observation(f"Action taken: {response}")
+
+        else:
+            print(">> 🔀 Routing to: MEDICAL INFO AGENT")
+            response = self.med_info_agent.think_and_act(user_input, patient_context)
+            print(f"✅ Medical Info says: {response}")
+            self.memory.add_observation(f"Advice given: {response}")
+
+# --- 5. INTERACTIVE LOOP ---
+
+if __name__ == "__main__":
+    system = CareCoordinator()
+    
+    print("\n" + "="*50)
+    print("🏥 VERTEX AI HEALTHCARE AGENT LIVE DEMO")
+    print("="*50)
+    print("Existing Patient Context: Diabetes Type 2, Penicillin Allergy")
+    print("Type 'exit' or 'quit' to stop the session.\n")
+
+    while True:
+        try:
+            # Get input from user
+            user_input = input("👤 PATIENT (You): ")
+            
+            if user_input.lower() in ['exit', 'quit', 'stop']:
+                print("\n👋 Session ended. Goodbye!")
+                break
+            
+            if not user_input.strip():
+                continue
+
+            # Process request
+            system.handle_patient_request(user_input)
+            print("-" * 50)
+            
+        except KeyboardInterrupt:
+            print("\n👋 Session interrupted.")
+            break
+        except Exception as e:
+            print(f"❌ Unexpected Error: {e}")
+
